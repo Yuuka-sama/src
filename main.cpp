@@ -1,20 +1,35 @@
 #include <iostream>
 #include <windows.h>
 
+<<<<<<< HEAD
 
+=======
+// 必须在包含 SDL.h 之前定义
+#define SDL_MAIN_HANDLED
+
+// FFmpeg 头文件
+>>>>>>> 8743f73ccb4200aa88df850e276f6af8dc6b1ed1
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
 }
 
+<<<<<<< HEAD
 
 
 int main(int argc, char* argv[]) {
+=======
+// SDL2 头文件
+#include <SDL.h>
+
+int main() {
+>>>>>>> 8743f73ccb4200aa88df850e276f6af8dc6b1ed1
     // 设置控制台输出为 UTF-8
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
+<<<<<<< HEAD
     if(argc <2){
         std::cerr << "Usage: " << argv[0] << " <input_file>" << std::endl;
         return -1;
@@ -61,3 +76,6 @@ int main(int argc, char* argv[]) {
     avformat_close_input(&fmt_ctx);
     return 0;
 }
+
+}
+
