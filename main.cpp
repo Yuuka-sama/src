@@ -19,11 +19,19 @@ extern "C" {
 
 #include <SDL.h>
 
+// 音频队列（线程安全）
 std::queue<std::vector<uint8_t>> audio_queue;
 std::mutex audio_mutex;
 std::condition_variable audio_cv;
+const size_t MAX_QUEUE_SIZE = 100;
 
-// SDL 音频回调：从队列取数据播放
+// 固定块大小：1024 帧 * 2 声道 * float(4字节) = 8192 字节
+const size_t CHUNK_SIZE = 1024 * 2 * sizeof(float);
+
+// 累积缓冲区
+std::vector<uint8_t> pending_buffer;
+
+// SDL 音频回调
 void audio_callback(void* userdata, Uint8* stream, int len) {
     std::unique_lock<std::mutex> lock(audio_mutex);
     if (audio_queue.empty()) {
@@ -35,11 +43,19 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
     size_t copy_len = (len < buf.size()) ? len : buf.size();
     SDL_memcpy(stream, buf.data(), copy_len);
 
+    // 如果数据不足，剩余部分填静音（正常情况应该恰好匹配）
+    if (copy_len < (size_t)len) {
+        SDL_memset(stream + copy_len, 0, len - copy_len);
+    }
+
     if (buf.size() > copy_len) {
         buf.erase(buf.begin(), buf.begin() + copy_len);
     } else {
         audio_queue.pop();
     }
+
+    // 通知主线程队列有空间了
+    audio_cv.notify_one();
 }
 
 int main(int argc, char* argv[]) {
@@ -55,7 +71,7 @@ int main(int argc, char* argv[]) {
     // 1. 打开输入文件
     AVFormatContext* fmt_ctx = nullptr;
     if (avformat_open_input(&fmt_ctx, filename, nullptr, nullptr) < 0) {
-        std::cerr << "Could not open file: " << filename << std::endl;
+        std::cerr << "Could not open file" << std::endl;
         return -1;
     }
     if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
@@ -73,37 +89,30 @@ int main(int argc, char* argv[]) {
         }
     }
     if (audio_stream_index == -1) {
-        std::cerr << "No audio stream found" << std::endl;
+        std::cerr << "No audio stream" << std::endl;
         avformat_close_input(&fmt_ctx);
         return -1;
     }
 
     AVCodecParameters* codecpar = fmt_ctx->streams[audio_stream_index]->codecpar;
 
-    // 3. 查找并打开解码器（优先使用 mp3float）
+    // 3. 优先使用 mp3float 解码器
     const AVCodec* codec = avcodec_find_decoder_by_name("mp3float");
+    if (!codec) codec = avcodec_find_decoder(codecpar->codec_id);
     if (!codec) {
-        codec = avcodec_find_decoder(codecpar->codec_id);
-    }
-    if (!codec) {
-        std::cerr << "Unsupported codec!" << std::endl;
+        std::cerr << "Unsupported codec" << std::endl;
         avformat_close_input(&fmt_ctx);
         return -1;
     }
+
     AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
     if (!codec_ctx) {
         std::cerr << "Could not allocate codec context" << std::endl;
         avformat_close_input(&fmt_ctx);
         return -1;
     }
-    if (avcodec_parameters_to_context(codec_ctx, codecpar) < 0) {
-        std::cerr << "Could not copy codec params to context" << std::endl;
-        avcodec_free_context(&codec_ctx);
-        avformat_close_input(&fmt_ctx);
-        return -1;
-    }
-    // 强制单线程解码，避免多线程数据未初始化
-    codec_ctx->thread_count = 1;
+    avcodec_parameters_to_context(codec_ctx, codecpar);
+    codec_ctx->thread_count = 1;  // 单线程解码
     if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
         std::cerr << "Could not open codec" << std::endl;
         avcodec_free_context(&codec_ctx);
@@ -111,56 +120,47 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    std::cout << "Codec sample rate: " << codec_ctx->sample_rate << std::endl;
+    std::cout << "Codec sample rate: " << codec_ctx->sample_rate
+              << ", channels: " << codec_ctx->ch_layout.nb_channels
+              << ", format: " << av_get_sample_fmt_name(codec_ctx->sample_fmt) << std::endl;
 
-    // 4. 初始化 SDL 音频
-    if (SDL_Init(SDL_INIT_AUDIO) < 0) {
-        std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
-        avcodec_free_context(&codec_ctx);
-        avformat_close_input(&fmt_ctx);
-        return -1;
-    }
-
+    // 4. 初始化 SDL 音频（固定 44100 Hz、双声道、浮点）
+    SDL_Init(SDL_INIT_AUDIO);
     SDL_AudioSpec desired, obtained;
     SDL_memset(&desired, 0, sizeof(desired));
-    desired.freq = codec_ctx->sample_rate;
-    desired.format = AUDIO_F32SYS;   // 改用浮点格式，避免 S16 转换问题
-    desired.channels = codec_ctx->ch_layout.nb_channels;
-    desired.samples = 1024;          // 减小缓冲区，降低延迟
+    desired.freq = 44100;
+    desired.format = AUDIO_F32SYS;
+    desired.channels = 2;
+    desired.samples = 1024;
     desired.callback = audio_callback;
 
     SDL_AudioDeviceID dev = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, 0);
     if (dev == 0) {
-        std::cerr << "SDL_OpenAudioDevice failed: " << SDL_GetError() << std::endl;
+        std::cerr << "SDL_OpenAudioDevice failed" << std::endl;
         avcodec_free_context(&codec_ctx);
         avformat_close_input(&fmt_ctx);
         SDL_Quit();
         return -1;
     }
+    std::cout << "Audio device: freq=" << obtained.freq
+              << ", channels=" << (int)obtained.channels
+              << ", format=" << obtained.format << std::endl;
 
-    std::cout << "Audio device opened: freq=" << obtained.freq
-              << " channels=" << (int)obtained.channels
-              << " format=" << obtained.format << std::endl;
-
-    // 5. 配置重采样上下文
+    // 5. 重采样设置：固定输出 44100 Hz、双声道、FLT
     SwrContext* swr_ctx = nullptr;
     AVChannelLayout in_ch_layout = codec_ctx->ch_layout;
     AVSampleFormat in_sample_fmt = codec_ctx->sample_fmt;
     int in_sample_rate = codec_ctx->sample_rate;
 
     AVChannelLayout out_ch_layout;
-    av_channel_layout_default(&out_ch_layout, obtained.channels);
-    AVSampleFormat out_sample_fmt = AV_SAMPLE_FMT_FLT;   // 输出浮点格式
-    int out_sample_rate = obtained.freq;
+    av_channel_layout_default(&out_ch_layout, 2);   // 双声道
+    AVSampleFormat out_sample_fmt = AV_SAMPLE_FMT_FLT;
+    int out_sample_rate = 44100;
 
     swr_ctx = swr_alloc();
     if (!swr_ctx) {
         std::cerr << "Could not allocate resampler" << std::endl;
-        SDL_CloseAudioDevice(dev);
-        avcodec_free_context(&codec_ctx);
-        avformat_close_input(&fmt_ctx);
-        SDL_Quit();
-        return -1;
+        exit(1);
     }
     av_opt_set_chlayout(swr_ctx, "in_chlayout", &in_ch_layout, 0);
     av_opt_set_int(swr_ctx, "in_sample_rate", in_sample_rate, 0);
@@ -169,46 +169,30 @@ int main(int argc, char* argv[]) {
     av_opt_set_int(swr_ctx, "out_sample_rate", out_sample_rate, 0);
     av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", out_sample_fmt, 0);
     if (swr_init(swr_ctx) < 0) {
-        std::cerr << "Could not initialize resampler" << std::endl;
-        swr_free(&swr_ctx);
-        SDL_CloseAudioDevice(dev);
-        avcodec_free_context(&codec_ctx);
-        avformat_close_input(&fmt_ctx);
-        SDL_Quit();
-        return -1;
+        std::cerr << "swr_init failed" << std::endl;
+        exit(1);
     }
 
     // 6. 开始播放
-    SDL_PauseAudioDevice(dev, 0);   // 返回 void，不能判断
+    SDL_PauseAudioDevice(dev, 0);
 
     AVPacket* packet = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
     int frame_count = 0;
 
-    while (av_read_frame(fmt_ctx, packet) >= 0) {
+    int read_ret;
+    while ((read_ret = av_read_frame(fmt_ctx, packet)) >= 0) {
         if (packet->stream_index == audio_stream_index) {
             int ret = avcodec_send_packet(codec_ctx, packet);
-            if (ret < 0) {
-                std::cerr << "Error sending packet" << std::endl;
-                break;
-            }
+            if (ret < 0) break;
             while (ret >= 0) {
                 ret = avcodec_receive_frame(codec_ctx, frame);
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                    break;
-                } else if (ret < 0) {
-                    std::cerr << "Error during decoding" << std::endl;
-                    break;
-                }
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+                else if (ret < 0) break;
 
                 frame_count++;
-                if (frame_count <= 3) {
-                    std::cout << "Frame " << frame_count << ": nb_samples=" << frame->nb_samples
-                              << " format=" << av_get_sample_fmt_name((AVSampleFormat)frame->format)
-                              << " channels=" << frame->ch_layout.nb_channels << std::endl;
-                }
 
-                // 重采样到 SDL 需要的格式
+                // 重采样
                 int dst_nb_samples = av_rescale_rnd(
                     swr_get_delay(swr_ctx, frame->sample_rate) + frame->nb_samples,
                     out_sample_rate, frame->sample_rate, AV_ROUND_UP);
@@ -222,23 +206,42 @@ int main(int argc, char* argv[]) {
                     std::cerr << "swr_convert error" << std::endl;
                     break;
                 }
-                out_ptr = out_buf.data();   // 重要：重置指针
-
+                out_ptr = out_buf.data();   // 重置指针
                 int out_bytes = av_samples_get_buffer_size(nullptr, out_ch_layout.nb_channels,
                                                            converted, out_sample_fmt, 1);
 
-                {
-                    std::lock_guard<std::mutex> lock(audio_mutex);
-                    audio_queue.push(std::vector<uint8_t>(out_ptr, out_ptr + out_bytes));
+                // 将数据累积到 pending_buffer，并切成固定块推入队列
+                std::unique_lock<std::mutex> lock(audio_mutex);
+                pending_buffer.insert(pending_buffer.end(), out_ptr, out_ptr + out_bytes);
+
+                while (pending_buffer.size() >= CHUNK_SIZE) {
+                    // 如果队列已满，等待空间
+                    audio_cv.wait(lock, [] { return audio_queue.size() < MAX_QUEUE_SIZE; });
+
+                    std::vector<uint8_t> chunk(pending_buffer.begin(), pending_buffer.begin() + CHUNK_SIZE);
+                    pending_buffer.erase(pending_buffer.begin(), pending_buffer.begin() + CHUNK_SIZE);
+                    audio_queue.push(std::move(chunk));
                 }
-                audio_cv.notify_all();
+                // 注意：这里不需要 notify，消费者回调会 notify
             }
         }
         av_packet_unref(packet);
     }
 
-    // 等待队列播放完毕（简单等待）
-    SDL_Delay(2000);
+    // 处理剩余不足一块的数据
+    {
+        std::lock_guard<std::mutex> lock(audio_mutex);
+        if (!pending_buffer.empty()) {
+            audio_queue.push(std::move(pending_buffer));
+        }
+    }
+
+    // 等待队列清空
+    {
+        std::unique_lock<std::mutex> lock(audio_mutex);
+        audio_cv.wait(lock, [] { return audio_queue.empty(); });
+    }
+    SDL_Delay(200);
 
     // 清理
     av_frame_free(&frame);
@@ -248,6 +251,5 @@ int main(int argc, char* argv[]) {
     avformat_close_input(&fmt_ctx);
     SDL_CloseAudioDevice(dev);
     SDL_Quit();
-
     return 0;
 }
