@@ -1,5 +1,5 @@
-#define NOMINMAX
-#define SDL_MAIN_HANDLED
+#define NOMINMAX                            //防止windows.h中定义的min/max宏与std::min/std::max冲突
+#define SDL_MAIN_HANDLED                    //防止SDL重定义main函数
 
 #include <iostream>
 #include <windows.h>
@@ -32,6 +32,8 @@ const size_t CHUNK_SIZE = 1024 * 2 * sizeof(float);
 std::vector<uint8_t> pending_buffer;
 
 // SDL 音频回调
+//如队列为空，则填充静音数据；否则从队列中取出数据填充到 stream 中，并从队列中移除已使用的数据
+//移除已复制数据，并通知主线程有空间
 void audio_callback(void* userdata, Uint8* stream, int len) {
     std::unique_lock<std::mutex> lock(audio_mutex);
     if (audio_queue.empty()) {
@@ -58,6 +60,9 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
     audio_cv.notify_one();
 }
 
+
+
+//主函数
 int main(int argc, char* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
@@ -69,6 +74,7 @@ int main(int argc, char* argv[]) {
     const char* filename = argv[1];
 
     // 1. 打开输入文件
+    //使用FFmpeg打开媒体文件，获取信息流，找到第一个音频流
     AVFormatContext* fmt_ctx = nullptr;
     if (avformat_open_input(&fmt_ctx, filename, nullptr, nullptr) < 0) {
         std::cerr << "Could not open file" << std::endl;
@@ -112,7 +118,7 @@ int main(int argc, char* argv[]) {
         return -1;
     }
     avcodec_parameters_to_context(codec_ctx, codecpar);
-    codec_ctx->thread_count = 1;  // 单线程解码
+    codec_ctx->thread_count = 1;  // 单线程解码，避免同步问题
     if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
         std::cerr << "Could not open codec" << std::endl;
         avcodec_free_context(&codec_ctx);
@@ -124,14 +130,14 @@ int main(int argc, char* argv[]) {
               << ", channels: " << codec_ctx->ch_layout.nb_channels
               << ", format: " << av_get_sample_fmt_name(codec_ctx->sample_fmt) << std::endl;
 
-    // 4. 初始化 SDL 音频（固定 44100 Hz、双声道、浮点）
+    // 4. 初始化 SDL 音频
     SDL_Init(SDL_INIT_AUDIO);
     SDL_AudioSpec desired, obtained;
     SDL_memset(&desired, 0, sizeof(desired));
-    desired.freq = 44100;
-    desired.format = AUDIO_F32SYS;
-    desired.channels = 2;
-    desired.samples = 1024;
+    desired.freq = 44100;               //固定输出采样率为 44100 Hz
+    desired.format = AUDIO_F32SYS;      //固定输出采样格式为 float
+    desired.channels = 2;               //固定输出为双声道  
+    desired.samples = 1024;             //回调请求的样本帧数
     desired.callback = audio_callback;
 
     SDL_AudioDeviceID dev = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, 0);
@@ -146,7 +152,7 @@ int main(int argc, char* argv[]) {
               << ", channels=" << (int)obtained.channels
               << ", format=" << obtained.format << std::endl;
 
-    // 5. 重采样设置：固定输出 44100 Hz、双声道、FLT
+    // 5. 初始化重采样设置：固定输出 44100 Hz、双声道、FLT
     SwrContext* swr_ctx = nullptr;
     AVChannelLayout in_ch_layout = codec_ctx->ch_layout;
     AVSampleFormat in_sample_fmt = codec_ctx->sample_fmt;
@@ -173,6 +179,8 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
+
+
     // 6. 开始播放
     SDL_PauseAudioDevice(dev, 0);
 
@@ -181,6 +189,7 @@ int main(int argc, char* argv[]) {
     int frame_count = 0;
 
     int read_ret;
+    //解码循环
     while ((read_ret = av_read_frame(fmt_ctx, packet)) >= 0) {
         if (packet->stream_index == audio_stream_index) {
             int ret = avcodec_send_packet(codec_ctx, packet);
